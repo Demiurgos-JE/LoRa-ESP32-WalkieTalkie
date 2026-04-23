@@ -1,0 +1,685 @@
+/**
+ * Heltec LoRa ESP32 V3 — Button-triggered Transceiver  v1.1
+ * ----------------------------------------------------------
+ * Board   : Heltec WiFi LoRa 32 (V3 / V3.2)  —  ESP32-S3 + SX1262
+ * Libraries:
+ *   RadioLib        — Arduino Library Manager
+ *   HT_SSD1306Wire  — Heltec ESP32 board package
+ *
+ * ── External wiring ──────────────────────────────────────────────────────────
+ *
+ *   All buttons use active-LOW logic: one leg to GPIO, other to GND.
+ *   Internal pull-ups are enabled — no external resistors needed.
+ *
+ *   BTN_HELLO  → GPIO4   Momentary — sends "Hallo von Vegard!"
+ *   BTN_HEART  → GPIO5   Momentary — sends heart graphic
+ *   BTN_SLEEP  → GPIO6   Momentary — 1st press = deep sleep, wakes on 2nd press
+ *   BTN_PING   → GPIO7   Momentary — toggles ping mode (10 s interval)
+ *   BUZZER     → GPIO2   Passive piezo buzzer (other leg to GND)
+ *                        Active buzzers also work but will ignore frequency.
+ *
+ *   GPIO 2, 4, 5, 6, 7 are all in Heltec's documented safe-for-external-use
+ *   set (GPIO 1,2,4,5,6,7,19,20,47,48) and are not used by LoRa SPI, I2C
+ *   OLED, Vext, or any boot-strapping function.
+ *
+ * ── Sleep behaviour (button toggle) ─────────────────────────────────────────
+ *   BTN_SLEEP is a momentary button, not a switch.
+ *   • 1st press  → device enters deep sleep immediately.
+ *   • While asleep, another press of BTN_SLEEP wakes the device.
+ *   Wake source: EXT1 on GPIO6, triggered on LOW level (button press = GND).
+ *   On wake, setup() detects ESP_SLEEP_WAKEUP_EXT1 and shows "WAKING UP..."
+ *   instead of the full boot splash.
+ *
+ *   Note: EXT1 wakes on LOW because during deep sleep the internal pull-up is
+ *   inactive; an external 10 kΩ pull-up resistor on GPIO6 is recommended to
+ *   prevent spurious wakes from floating input. Alternatively, connect a
+ *   100 nF decoupling cap from GPIO6 to GND to suppress glitches.
+ *
+ * ── Ping mode ────────────────────────────────────────────────────────────────
+ *   BTN_PING toggles ping mode on/off.
+ *   While active: every PING_INTERVAL_MS (10 s) a "PING:<shortID>" packet
+ *   is transmitted. The display shows "PING MODE" and a countdown.
+ *   When the remote device receives a PING packet it automatically replies
+ *   with "PONG:<its shortID>" — no user action needed.
+ *   When a PONG is received the display shows "PONG from <ID>" and the
+ *   buzzer plays a short confirmation tone.
+ *   Pressing BTN_PING again exits ping mode and returns to normal.
+ *
+ * ── Buzzer — receive notification ────────────────────────────────────────────
+ *   A pleasant ascending arpeggio (C5→E5→G5→C6) plays whenever any message
+ *   is received. The sequence uses the Arduino tone() function (PWM on GPIO2).
+ *   A shorter two-note chime (G5→C6) confirms a received PONG.
+ *   Buzzer is silent during transmission and sleep.
+ *
+ * ── Message protocol ─────────────────────────────────────────────────────────
+ *   "HEART"         — heart graphic
+ *   "PING:<id>"     — ping request; remote replies automatically
+ *   "PONG:<id>"     — ping reply
+ *   anything else   — plain text message
+ *
+ * ── All previous hardware fixes retained ─────────────────────────────────────
+ *   • Vext active-LOW (GPIO36 LOW = OLED powered)
+ *   • GEOMETRY_128_64, RST managed manually, correct I2C freq
+ *   • esp_read_mac() instead of WiFi.macAddress()
+ *   • SX1262, DIO1/BUSY, setDio1Action()
+ *   • portMUX for rxFlag (dual-core S3 safe)
+ *   • getRSSI() only after readData()
+ *   • Button struct forward-declared before globals
+ *   • RadioLib transmit() receives mutable String copy
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <RadioLib.h>
+#include <esp_mac.h>
+#include <esp_sleep.h>
+
+// ─── OLED ─────────────────────────────────────────────────────────────────────
+#include "HT_SSD1306Wire.h"
+
+#define OLED_ADDR  0x3C
+#define OLED_SDA   17
+#define OLED_SCL   18
+#define OLED_RST   21
+#define VEXT_PIN   36
+#define VEXT_ON    LOW    // P-channel FET: LOW = on
+#define VEXT_OFF   HIGH
+
+static SSD1306Wire display(OLED_ADDR, 50000, OLED_SDA, OLED_SCL, GEOMETRY_128_64, OLED_RST);
+
+// ─── Buzzer ───────────────────────────────────────────────────────────────────
+// Connect a passive piezo buzzer between GPIO2 and GND.
+// tone() drives a PWM square wave — works with passive buzzers.
+// Active buzzers (which contain their own oscillator) will simply click
+// on/off with each note but will not reproduce pitch.
+#define BUZZER_PIN  2
+
+// ─── External controls ────────────────────────────────────────────────────────
+#define BTN_HELLO   4    // send text message
+#define BTN_HEART   5    // send heart
+#define BTN_SLEEP   6    // toggle deep sleep
+#define BTN_PING    7    // toggle ping mode
+
+#define DEBOUNCE_MS 50
+
+// ─── LoRa ────────────────────────────────────────────────────────────────────
+#define LORA_SCK        9
+#define LORA_MISO       11
+#define LORA_MOSI       10
+#define LORA_SS         8
+#define LORA_RST        12
+#define LORA_BUSY       13
+#define LORA_DIO1       14
+
+SX1262 radio = new Module(LORA_SS, LORA_DIO1, LORA_RST, LORA_BUSY);
+
+#define LORA_FREQ       868.0
+#define LORA_BW         125.0
+#define LORA_SF         12
+#define LORA_CR         8
+#define LORA_SYNC_WORD  0x34
+#define LORA_TX_POWER   22
+
+// ─── Message tokens ───────────────────────────────────────────────────────────
+#define HEART_TOKEN  "HERZ"
+#define PING_PREFIX  "PING:"
+#define PONG_PREFIX  "PONG:"
+
+// ─── Ping mode ────────────────────────────────────────────────────────────────
+#define PING_INTERVAL_MS  10000UL
+
+bool     pingMode        = false;
+uint32_t lastPingMs      = 0;
+
+// ─── Button struct — defined before globals so Arduino pre-processor
+//     can generate a valid forward declaration for updateButton(). ─────────────
+struct Button {
+    uint8_t  pin;
+    bool     lastRaw;
+    bool     state;
+    uint32_t lastChangeMs;
+    bool     pressed;
+};
+
+void updateButton(Button& b);   // forward declaration
+
+Button btnHello = { BTN_HELLO, HIGH, HIGH, 0, false };
+Button btnHeart = { BTN_HEART, HIGH, HIGH, 0, false };
+Button btnSleep = { BTN_SLEEP, HIGH, HIGH, 0, false };
+Button btnPing  = { BTN_PING,  HIGH, HIGH, 0, false };
+
+// ─── ISR / rx flag ───────────────────────────────────────────────────────────
+static portMUX_TYPE rxMux = portMUX_INITIALIZER_UNLOCKED;
+volatile bool rxFlag = false;
+
+void IRAM_ATTR onReceive() {
+    portENTER_CRITICAL_ISR(&rxMux);
+    rxFlag = true;
+    portEXIT_CRITICAL_ISR(&rxMux);
+}
+
+// ─── Identity ─────────────────────────────────────────────────────────────────
+char   myMac[18];
+String shortID;
+
+// ─── Last transmitted message — used to discard self-echo on RX ──────────────
+// The SX1262 calls startReceive() immediately after TX completes. At short
+// range the device can receive its own packet before the signal fully clears.
+// Storing the last TX payload and comparing it in handleReceive() lets us
+// discard the echo without any delay, so fast PONG replies are never missed.
+String lastTxMsg = "";
+
+// ═════════════════════════════════════════════════════════════════════════════
+// BUZZER
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Play a single note: frequency (Hz), duration (ms).
+// noTone() is called after each note; a short gap between notes
+// articulates them clearly on a piezo.
+void playNote(uint16_t freq, uint16_t dur) {
+    tone(BUZZER_PIN, freq, dur);
+    delay(dur + 20);   // note duration + 20 ms gap
+    noTone(BUZZER_PIN);
+}
+
+// Ascending C-major arpeggio: C5 → E5 → G5 → C6
+// Played on any incoming message. Bright, positive, not intrusive.
+void buzzReceive() {
+    playNote(523, 80);   // C5
+    playNote(659, 80);   // E5
+    playNote(784, 80);   // G5
+    playNote(1047, 120); // C6  — slightly longer top note
+}
+
+// Short two-note chime for PONG confirmation: G5 → C6
+void buzzPong() {
+    playNote(784,  90);  // G5
+    playNote(1047, 130); // C6
+}
+
+// Single short blip used as feedback when buttons are pressed
+void buzzTx() {
+    playNote(880, 60);   // A5 — quick, unobtrusive
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// BUTTON DEBOUNCE
+// ═════════════════════════════════════════════════════════════════════════════
+
+void updateButton(Button& b) {
+    b.pressed = false;
+    bool raw = digitalRead(b.pin);
+    if (raw != b.lastRaw) {
+        b.lastRaw      = raw;
+        b.lastChangeMs = millis();
+    }
+    if ((millis() - b.lastChangeMs) >= DEBOUNCE_MS && raw != b.state) {
+        b.state = raw;
+        if (raw == LOW) {
+            b.pressed = true;
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// OLED
+// ═════════════════════════════════════════════════════════════════════════════
+
+void initOLED() {
+    pinMode(VEXT_PIN, OUTPUT);
+    digitalWrite(VEXT_PIN, VEXT_ON);
+    delay(100);
+
+    pinMode(OLED_RST, OUTPUT);
+    digitalWrite(OLED_RST, LOW);
+    delay(20);
+    digitalWrite(OLED_RST, HIGH);
+    delay(100);
+
+    display.init();
+    display.flipScreenVertically();
+    display.setContrast(255);
+    display.clear();
+    display.display();
+}
+
+// Draws the persistent header bar and returns the first usable Y below it.
+int drawHeader() {
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.drawString(0, 0, "LoRa TRX");
+    display.setTextAlignment(TEXT_ALIGN_RIGHT);
+    display.drawString(128, 0, shortID);
+    display.drawHorizontalLine(0, 12, 128);
+    return 14;
+}
+
+void showText(const String& line1,
+              const String& line2 = "",
+              const String& line3 = "")
+{
+    display.clear();
+    int y = drawHeader();
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.drawString(0, y,      line1);
+    display.drawString(0, y + 13, line2);
+    display.drawString(0, y + 26, line3);
+    display.display();
+}
+
+// ─── Heart bitmap ─────────────────────────────────────────────────────────────
+static const uint8_t HEART_W = 9;
+static const uint8_t HEART_H = 8;
+static const uint8_t heartBitmap[HEART_H][HEART_W] = {
+    { 0,1,1,0,0,0,1,1,0 },
+    { 1,1,1,1,0,1,1,1,1 },
+    { 1,1,1,1,1,1,1,1,1 },
+    { 1,1,1,1,1,1,1,1,1 },
+    { 0,1,1,1,1,1,1,1,0 },
+    { 0,0,1,1,1,1,1,0,0 },
+    { 0,0,0,1,1,1,0,0,0 },
+    { 0,0,0,0,1,0,0,0,0 },
+};
+
+void showHeart() {
+    display.clear();
+    int contentY = drawHeader();
+    const int scale  = 4;
+    const int totalW = HEART_W * scale;
+    const int totalH = HEART_H * scale;
+    const int availH = 64 - contentY;
+    const int x0     = (128 - totalW) / 2;
+    const int y0     = contentY + (availH - totalH) / 2;
+    for (int row = 0; row < HEART_H; row++) {
+        for (int col = 0; col < HEART_W; col++) {
+            if (heartBitmap[row][col]) {
+                display.fillRect(x0 + col * scale,
+                                 y0 + row * scale,
+                                 scale - 1, scale - 1);
+            }
+        }
+    }
+    display.display();
+}
+
+// ─── Boot splash ──────────────────────────────────────────────────────────────
+void drawBootScreen() {
+    display.clear();
+    display.setFont(ArialMT_Plain_16);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.drawString(0, 0, "LoRa TRX");
+
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_RIGHT);
+    display.drawString(128, 3, "ID:" + shortID);
+    display.drawHorizontalLine(0, 18, 128);
+
+    const int cx = 64, cy = 46;
+    display.fillCircle(cx, cy,  3);
+    display.drawCircle(cx, cy,  9);
+    display.drawCircle(cx, cy, 16);
+    display.drawCircle(cx, cy, 23);
+
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    char freqBuf[16];
+    snprintf(freqBuf, sizeof(freqBuf), "%.0f MHz", (double)LORA_FREQ);
+    display.drawString(64, 53, String(freqBuf));
+    display.display();
+}
+
+// ─── Full-screen PONG confirmation — no header shortID, remote ID is dominant ──
+// Using showText() draws shortID in the header via drawHeader(), which the user
+// reads as the PONG sender. This function bypasses drawHeader() entirely so the
+// only ID on screen is the one that actually came from the remote device.
+void showPongReceived(const String& remoteID, const String& rssiSnr) {
+    display.clear();
+    display.setFont(ArialMT_Plain_16);
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.drawString(64, 0,  "PONG von");
+    display.drawString(64, 18, remoteID);
+    display.drawHorizontalLine(0, 36, 128);
+    display.setFont(ArialMT_Plain_10);
+    display.drawString(64, 40, rssiSnr);
+    display.drawString(64, 53, "Nächster ping in 10s");
+    display.display();
+}
+
+// ─── Full-screen PING display — same reasoning, remote ID is dominant ──────────
+void showPingReceived(const String& remoteID) {
+    display.clear();
+    display.setFont(ArialMT_Plain_16);
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.drawString(64, 0,  "PING von");
+    display.drawString(64, 18, remoteID);
+    display.drawHorizontalLine(0, 36, 128);
+    display.setFont(ArialMT_Plain_10);
+    display.drawString(64, 46, "Sende PONG...");
+    display.display();
+}
+
+// ─── Ready screen — shows current mode hint ───────────────────────────────────
+void showReady() {
+    if (pingMode) {
+        showText("PING MODUS  " + shortID,
+                 "",
+                 "Suche=Stop Suche");
+    } else {
+        showText("BEREIT  " + shortID,
+                 "",
+                 "");
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DEEP SLEEP  (button-toggle variant)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// The same physical button (BTN_SLEEP / GPIO6) both sends the device to sleep
+// AND wakes it up:
+//
+//   ACTIVE  → press BTN_SLEEP → enterSleep() → deep sleep begins
+//   SLEEPING → press BTN_SLEEP → EXT1 fires LOW on GPIO6 → chip resets
+//                                → setup() detects ESP_SLEEP_WAKEUP_EXT1
+//
+// During deep sleep the internal pull-up on GPIO6 is OFF (the GPIO matrix is
+// powered down). An external 10 kΩ pull-up from GPIO6 to 3.3 V keeps the line
+// HIGH at rest; pressing the button pulls it LOW and fires EXT1.
+// If you cannot add a pull-up resistor, a 100 nF cap from GPIO6 to GND will
+// suppress short glitches but is not a substitute for the pull-up.
+//
+void enterSleep() {
+    Serial.println("Gehe schlafen. zzZ...");
+    Serial.flush();
+
+    pingMode = false;   // cancel ping mode before sleeping
+
+    showText("  Schlafe...", "", "Drücke SCHLAF erneut.");
+    delay(1500);
+
+    display.clear();
+    display.display();
+    display.displayOff();
+    digitalWrite(VEXT_PIN, VEXT_OFF);
+
+    radio.sleep();
+
+    // Wake on LOW (button press pulls GPIO6 to GND).
+    // ESP_EXT1_WAKEUP_ANY_LOW triggers when ANY pin in the mask goes LOW.
+    esp_sleep_enable_ext1_wakeup((1ULL << BTN_SLEEP), ESP_EXT1_WAKEUP_ANY_LOW);
+
+    esp_deep_sleep_start();
+    // Never reached — chip resets on wake; setup() runs from the top.
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// LORA HELPERS
+// ═════════════════════════════════════════════════════════════════════════════
+
+void startReceive() {
+    int state = radio.startReceive();
+    if (state != RADIOLIB_ERR_NONE) {
+        showText("RX FAIL", "err:" + String(state));
+        Serial.println("startReceive failed: " + String(state));
+    }
+}
+
+// Transmit a string. Takes const ref and copies internally (RadioLib needs
+// a non-const String&).
+void transmitString(const String& msg) {
+    radio.standby();
+    lastTxMsg = msg;          // record before TX so echo guard is ready
+    String txBuf = msg;
+    int state = radio.transmit(txBuf);
+    if (state == RADIOLIB_ERR_NONE) {
+        Serial.println("TX OK: " + msg);
+    } else {
+        Serial.println("TX FAIL: " + String(state));
+        lastTxMsg = "";
+        showText("TX FAILED", "err:" + String(state));
+        delay(1500);
+    }
+    startReceive();
+}
+
+// ─── Receive handler ──────────────────────────────────────────────────────────
+void handleReceive() {
+    String incoming;
+    int state = radio.readData(incoming);
+
+    if (state != RADIOLIB_ERR_NONE) {
+        if (state == RADIOLIB_ERR_CRC_MISMATCH)
+            Serial.println("RX CRC error");
+        else
+            Serial.println("RX error: " + String(state));
+        startReceive();
+        return;
+    }
+
+    // ── Self-echo guard ───────────────────────────────────────────────────────
+    // If the received content matches the last thing we transmitted, this is
+    // our own packet reflected back. Discard it and clear the stored message
+    // so a genuine identical message from the remote device is not suppressed.
+    if (incoming == lastTxMsg) {
+        Serial.println("Discarding self-echo: " + incoming);
+        lastTxMsg = "";
+        startReceive();
+        return;
+    }
+    lastTxMsg = "";   // clear after first non-echo packet — guard is spent
+
+    float rssi = radio.getRSSI();
+    float snr  = radio.getSNR();
+    Serial.println("RX: " + incoming +
+                   "  RSSI:" + String(rssi, 1) +
+                   "  SNR:"  + String(snr,  1));
+
+    // ── PING received → reply automatically ──────────────────────────────────
+    if (incoming.startsWith(PING_PREFIX)) {
+        String senderID = incoming.substring(strlen(PING_PREFIX));
+
+        // Discard if this is our own ping echoed back.
+        if (senderID == shortID) {
+            Serial.println("Discarding self-echo PING");
+            startReceive();
+            return;
+        }
+
+        Serial.println("Ping von " + senderID + " — sende PONG");
+        showPingReceived(senderID);
+        buzzReceive();
+        transmitString(String(PONG_PREFIX) + shortID);
+        showReady();
+        return;
+    }
+
+    // ── PONG received (reply to our own ping) ─────────────────────────────────
+    if (incoming.startsWith(PONG_PREFIX)) {
+        String senderID = incoming.substring(strlen(PONG_PREFIX));
+
+        // Discard if the embedded ID matches our own — this is our own
+        // transmission echoed back (SX1262 re-arms RX immediately after TX
+        // and can receive its own packet at close range).
+        // Also discard if we are not in ping mode — we never sent a ping
+        // so this PONG is not meant for us.
+        if (senderID == shortID || !pingMode) {
+            Serial.println("Discarding self-echo or unsolicited PONG");
+            startReceive();
+            return;
+        }
+
+        Serial.println("Pong von " + senderID);
+        showPongReceived(senderID,
+                         "RSSI:" + String(rssi, 1) +
+                         " SNR:" + String(snr, 1));
+        buzzPong();
+        delay(2000);
+        showReady();
+        return;
+    }
+
+    // ── Heart ─────────────────────────────────────────────────────────────────
+    if (incoming == HEART_TOKEN) {
+        showHeart();
+        buzzReceive();
+        startReceive();
+        return;
+    }
+
+    // ── Plain text message ────────────────────────────────────────────────────
+    String l1 = incoming.substring(0, 21);
+    String l2 = incoming.length() > 21 ? incoming.substring(21, 42) : "";
+    String l3 = incoming.length() > 42 ? incoming.substring(42, 63) : "";
+    showText(l1, l2, l3);
+    buzzReceive();
+    startReceive();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SETUP
+// ═════════════════════════════════════════════════════════════════════════════
+
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+
+    // ── GPIO ─────────────────────────────────────────────────────────────────
+    pinMode(BTN_HELLO, INPUT_PULLUP);
+    pinMode(BTN_HEART, INPUT_PULLUP);
+    pinMode(BTN_SLEEP, INPUT_PULLUP);
+    pinMode(BTN_PING,  INPUT_PULLUP);
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, LOW);
+
+    // ── OLED ─────────────────────────────────────────────────────────────────
+    initOLED();
+
+    // ── Identity ─────────────────────────────────────────────────────────────
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(myMac, sizeof(myMac), "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    char shortBuf[5];
+    snprintf(shortBuf, sizeof(shortBuf), "%02x%02x", mac[4], mac[5]);
+    shortID = String(shortBuf);
+    shortID.toUpperCase();
+    Serial.println("MAC: " + String(myMac) + "  ID: " + shortID);
+
+    // ── Splash — distinguish cold boot from wake-from-sleep ──────────────────
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+        showText("WACHE AUF...", shortID, "Initialisiere Radio");
+        delay(1000);
+    } else {
+        drawBootScreen();
+        delay(2500);
+    }
+
+    // ── LoRa ─────────────────────────────────────────────────────────────────
+    SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+    Serial.println("Initialisiere Radio...");
+
+    int state = radio.begin(LORA_FREQ, LORA_BW, LORA_SF, LORA_CR,
+                            LORA_SYNC_WORD, LORA_TX_POWER);
+    if (state != RADIOLIB_ERR_NONE) {
+        showText("Radio FAILED", "err:" + String(state));
+        Serial.println("Radio init failed: " + String(state));
+        while (true) { delay(1000); }
+    }
+
+    radio.setDio1Action(onReceive);
+
+    showReady();
+    Serial.println("Bereit. Lausche...");
+    delay(1500);
+
+    startReceive();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// LOOP
+// ═════════════════════════════════════════════════════════════════════════════
+
+void loop() {
+    // ── Debounce all buttons ──────────────────────────────────────────────────
+    updateButton(btnHello);
+    updateButton(btnHeart);
+    updateButton(btnSleep);
+    updateButton(btnPing);
+
+    // ── BTN_SLEEP: enter deep sleep on press ──────────────────────────────────
+    // Wake path: EXT1 on GPIO6 LOW fires on next button press while sleeping.
+    if (btnSleep.pressed) {
+        enterSleep();
+        // Never returns — chip resets on wake, setup() runs again.
+    }
+
+    // ── BTN_HELLO: send text message ──────────────────────────────────────────
+    if (btnHello.pressed) {
+        String msg = "Hallo von ...!";
+        buzzTx();
+        showText("Sende...", msg);
+        transmitString(msg);
+        showText("Gesendet!", msg);
+        delay(800);
+        display.clear();
+        display.display();
+        showReady();
+    }
+
+    // ── BTN_HEART: send heart ────────────────────────────────────────────────
+    if (btnHeart.pressed) {
+        buzzTx();
+        showText("Sende Herz...");
+        transmitString(HEART_TOKEN);
+        showHeart();
+        delay(800);
+        display.clear();
+        display.display();
+        showReady();
+    }
+
+    // ── BTN_PING: toggle ping mode ────────────────────────────────────────────
+    if (btnPing.pressed) {
+        pingMode = !pingMode;
+        if (pingMode) {
+            lastPingMs = millis() - PING_INTERVAL_MS;  // fire first ping immediately
+            Serial.println("Suchmodus AN");
+        } else {
+            Serial.println("Suchmodus AUS");
+        }
+        showReady();
+    }
+
+    // ── Ping interval ─────────────────────────────────────────────────────────
+    if (pingMode && (millis() - lastPingMs) >= PING_INTERVAL_MS) {
+        lastPingMs = millis();
+        String pingMsg = String(PING_PREFIX) + shortID;
+        Serial.println("Sende ping: " + pingMsg);
+
+        // Countdown display: "PING MODE  3..." then send
+        showText("SUCHMODUS  " + shortID, "Sende ping...");
+        buzzTx();
+        transmitString(pingMsg);
+
+        // Show next-ping countdown on display while listening
+        showText("SUCHMODUS  " + shortID,
+                 "Nächster ping in 10s",
+                 "SUCHE = stop");
+    }
+
+    // ── Incoming packet ───────────────────────────────────────────────────────
+    bool doRx = false;
+    portENTER_CRITICAL(&rxMux);
+    doRx   = rxFlag;
+    rxFlag = false;
+    portEXIT_CRITICAL(&rxMux);
+
+    if (doRx) {
+        handleReceive();
+    }
+
+    yield();
+}

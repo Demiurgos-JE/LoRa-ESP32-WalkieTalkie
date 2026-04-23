@@ -11,7 +11,7 @@
  *   All buttons use active-LOW logic: one leg to GPIO, other to GND.
  *   Internal pull-ups are enabled — no external resistors needed.
  *
- *   BTN_HELLO  → GPIO4   Momentary — sends "Hallo von Vegard!"
+ *   BTN_HELLO  → GPIO4   Momentary — sends "Hallo von ...!"
  *   BTN_HEART  → GPIO5   Momentary — sends heart graphic
  *   BTN_SLEEP  → GPIO6   Momentary — 1st press = deep sleep, wakes on 2nd press
  *   BTN_PING   → GPIO7   Momentary — toggles ping mode (10 s interval)
